@@ -170,20 +170,50 @@ def _build_prompt(messages):
     return "\n\n".join(parts).strip()
 
 def _parse_tool_call(text):
-    for line in text.split('\n'):
-        line = line.strip()
-        if line.startswith('{"tool"') or line.startswith('{"function"'):
-            try:
-                call = json.loads(line)
-                return call.get('tool') or call.get('function'), call.get('arguments', {})
-            except:
-                pass
-    m = re.search(r'```json\s*(\{.*?\}|\[.*?\])\s*```', text, re.DOTALL)
+    """Extract tool call JSON from anywhere in model output.
+    Searches for "tool" or "function" keys, then does balanced brace matching."""
+    idx = 0
+    while True:
+        # Find "tool" or "function" key anywhere in text
+        tool_pos = text.find('"tool"', idx)
+        func_pos = text.find('"function"', idx)
+        if tool_pos == -1 and func_pos == -1:
+            break
+        pos = tool_pos if tool_pos != -1 and (func_pos == -1 or tool_pos < func_pos) else func_pos
+        idx = pos + 1
+        # Find the opening brace before the key
+        brace = text.rfind('{', 0, pos)
+        if brace == -1:
+            continue
+        # Balanced brace matching (handles nested {})
+        i = brace
+        depth = 0
+        while i < len(text):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    chunk = text[brace:i+1]
+                    try:
+                        obj = json.loads(chunk)
+                        if isinstance(obj, dict):
+                            name = obj.get('tool') or obj.get('function')
+                            if name:
+                                return name, obj.get('arguments', {})
+                    except:
+                        pass
+                    break
+            i += 1
+    # Last resort: markdown code block
+    m = re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, re.DOTALL)
     if m:
         try:
-            call = json.loads(m.group(1))
-            if isinstance(call, dict):
-                return call.get('tool') or call.get('function'), call.get('arguments', {})
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                name = obj.get('tool') or obj.get('function')
+                if name:
+                    return name, obj.get('arguments', {})
         except:
             pass
     return None, None
@@ -218,6 +248,7 @@ class GLMModePool:
         self._pages = [None] * size
         self._queue = None
         self._heartbeat_task = None
+        self._replenishing = set()
 
     async def start(self):
         self.playwright = await async_playwright().start()
@@ -272,10 +303,11 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
 
     async def _recreate_page(self, idx):
         old = self._pages[idx]
-        try:
-            await old.close()
-        except:
-            pass
+        if old:
+            try:
+                await old.close()
+            except:
+                pass
         await asyncio.sleep(1)
         self._pages[idx] = await _create_page(self.ctx, self.model)
 
@@ -283,29 +315,61 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
         while True:
             await asyncio.sleep(30)
             for i in range(self.size):
+                if i in self._replenishing:
+                    continue
                 if not await self._check_health(self._pages[i]):
                     print(f"[GLMMode] Heartbeat: page {i} unhealthy, recreating", file=sys.stderr)
                     await self._recreate_page(i)
                     await asyncio.sleep(5)
 
+    async def _replenish(self, idx):
+        """Close old page and create a fresh one in background."""
+        self._replenishing.add(idx)
+        # Close old page
+        old = self._pages[idx]
+        if old:
+            try:
+                await old.close()
+            except:
+                pass
+        self._pages[idx] = None
+        # Create new page
+        for attempt in range(5):
+            try:
+                new_page = await _create_page(self.ctx, self.model)
+                if await self._check_health(new_page):
+                    self._pages[idx] = new_page
+                    self._queue.put_nowait(idx)
+                    self._replenishing.discard(idx)
+                    return
+                try:
+                    await new_page.close()
+                except:
+                    pass
+            except Exception as e:
+                print(f"[GLMMode] _replenish({idx}) attempt {attempt+1} failed: {e}", file=sys.stderr)
+            await asyncio.sleep(3)
+        print(f"[GLMMode] _replenish({idx}) UNAVAILABLE after 5 attempts", file=sys.stderr)
+        self._pages[idx] = None
+        self._replenishing.discard(idx)
+
     async def execute(self, prompt):
         idx = await self._queue.get()
         page = self._pages[idx]
 
-        if not await self._check_health(page):
+        if page is None or not await self._check_health(page):
             print(f"[GLMMode] Page {idx} unhealthy on acquire, recreating", file=sys.stderr)
             await self._recreate_page(idx)
             page = self._pages[idx]
 
         try:
-            result, new_page = await _send_prompt_once(self.ctx, page, prompt, self.model)
-            self._pages[idx] = new_page
-            self._queue.put_nowait(idx)
+            result, _ = await _send_prompt_once(self.ctx, page, prompt, self.model)
+            # Close page immediately and start creating a fresh one
+            asyncio.create_task(self._replenish(idx))
             return result
         except Exception as e:
             print(f"[GLMMode] Page {idx} error: {e}, recreating", file=sys.stderr)
-            await self._recreate_page(idx)
-            self._queue.put_nowait(idx)
+            await self._replenish(idx)  # await — need slot ready for next request
             raise
 
     async def chat(self, messages, tools=None):
@@ -331,10 +395,11 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
             except asyncio.CancelledError:
                 pass
         for p in self._pages:
-            try:
-                await p.close()
-            except:
-                pass
+            if p:
+                try:
+                    await p.close()
+                except:
+                    pass
         if self.browser:
             await self.browser.close()
         if self.playwright:
