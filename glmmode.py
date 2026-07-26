@@ -5,10 +5,10 @@ from playwright.async_api import async_playwright
 URL = "https://chat.z.ai"
 log = logging.getLogger("glmmode")
 
-SSE_TIMEOUT = 120
+SSE_TIMEOUT = 90
 MAX_ATTEMPTS = 2
 POOL_SIZE = 3
-CREATE_PAGE_DELAY = 0.5
+CREATE_PAGE_DELAY = 0.2
 
 _LAUNCH_ARGS = [
     "--no-sandbox",
@@ -23,7 +23,7 @@ _LAUNCH_ARGS = [
 async def _create_page(ctx, model):
     page = await ctx.new_page()
     await page.goto(URL, wait_until="domcontentloaded", timeout=20000)
-    await asyncio.sleep(4)
+    await asyncio.sleep(1)
     if model:
         try:
             btn = await page.query_selector("button[aria-label='Select a model']")
@@ -31,13 +31,13 @@ async def _create_page(ctx, model):
                 txt = await btn.inner_text()
                 if txt.strip() != model:
                     await btn.click()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     opt = await page.query_selector(f"[class*='option']:has-text('{model}')")
                     if opt:
                         await opt.click()
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.2)
                     await page.keyboard.press("Escape")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
         except:
             pass
     return page
@@ -47,7 +47,7 @@ async def _refresh_page(ctx, page, model):
         await page.close()
     except:
         pass
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
     return await _create_page(ctx, model)
 
 def _detect_captcha(body_text):
@@ -92,14 +92,7 @@ def _parse_sse(raw):
     return {"text": ''.join(answer).strip(), "reasoning": ''.join(reasoning).strip()}
 
 async def _send_prompt_once(ctx, page, prompt, model):
-    prev_handler = None
     for attempt in range(MAX_ATTEMPTS):
-        if prev_handler is not None:
-            try:
-                page.remove_listener("response", prev_handler)
-            except:
-                pass
-
         bodies = {}
         bodies[attempt] = None
 
@@ -110,15 +103,14 @@ async def _send_prompt_once(ctx, page, prompt, model):
                 except:
                     pass
 
-        prev_handler = capture
         page.on("response", capture)
 
         await _type_and_send(page, prompt)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
         await _click_send(page)
 
-        for _ in range(SSE_TIMEOUT // 2):
-            await asyncio.sleep(2)
+        for _ in range(SSE_TIMEOUT):
+            await asyncio.sleep(1)
             if bodies.get(attempt) is not None:
                 try:
                     page.remove_listener("response", capture)
@@ -130,11 +122,11 @@ async def _send_prompt_once(ctx, page, prompt, model):
             if _detect_captcha(bt):
                 print(f"[GLMMode] Captcha, refreshing (attempt {attempt+1})", file=sys.stderr)
                 page = await _refresh_page(ctx, page, model)
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 break
         else:
             if attempt < MAX_ATTEMPTS - 1:
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
                 page = await _refresh_page(ctx, page, model)
                 continue
 
@@ -170,22 +162,17 @@ def _build_prompt(messages):
     return "\n\n".join(parts).strip()
 
 def _parse_tool_call(text):
-    """Extract tool call JSON from anywhere in model output.
-    Searches for "tool" or "function" keys, then does balanced brace matching."""
     idx = 0
     while True:
-        # Find "tool" or "function" key anywhere in text
         tool_pos = text.find('"tool"', idx)
         func_pos = text.find('"function"', idx)
         if tool_pos == -1 and func_pos == -1:
             break
         pos = tool_pos if tool_pos != -1 and (func_pos == -1 or tool_pos < func_pos) else func_pos
         idx = pos + 1
-        # Find the opening brace before the key
         brace = text.rfind('{', 0, pos)
         if brace == -1:
             continue
-        # Balanced brace matching (handles nested {})
         i = brace
         depth = 0
         while i < len(text):
@@ -205,7 +192,6 @@ def _parse_tool_call(text):
                         pass
                     break
             i += 1
-    # Last resort: markdown code block
     m = re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, re.DOTALL)
     if m:
         try:
@@ -248,7 +234,7 @@ class GLMModePool:
         self._pages = [None] * size
         self._queue = None
         self._heartbeat_task = None
-        self._replenishing = set()
+        self._pending_capture = {}  # track SSE per request
 
     async def start(self):
         self.playwright = await async_playwright().start()
@@ -263,7 +249,7 @@ class GLMModePool:
             locale="en-US",
             timezone_id="America/New_York",
         )
-        await self.ctx.add_init_script("""
+        await self.ctx.add_init_script("""\
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
 Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
@@ -275,13 +261,13 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
                     self._pages[i] = await _create_page(self.ctx, self.model)
                 except Exception as e:
                     print(f"[GLMMode] Page {i} create failed: {e}", file=sys.stderr)
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(1)
                     continue
                 if await self._check_health(self._pages[i]):
                     break
                 print(f"[GLMMode] Page {i} unhealthy, recreating...", file=sys.stderr)
                 await self._recreate_page(i)
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
             else:
                 print(f"[GLMMode] Page {i} UNAVAILABLE after 5 attempts", file=sys.stderr)
             self._queue.put_nowait(i)
@@ -308,68 +294,43 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
                 await old.close()
             except:
                 pass
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
         self._pages[idx] = await _create_page(self.ctx, self.model)
 
     async def _heartbeat(self):
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
             for i in range(self.size):
-                if i in self._replenishing:
-                    continue
                 if not await self._check_health(self._pages[i]):
                     print(f"[GLMMode] Heartbeat: page {i} unhealthy, recreating", file=sys.stderr)
                     await self._recreate_page(i)
-                    await asyncio.sleep(5)
-
-    async def _replenish(self, idx):
-        """Close old page and create a fresh one in background."""
-        self._replenishing.add(idx)
-        # Close old page
-        old = self._pages[idx]
-        if old:
-            try:
-                await old.close()
-            except:
-                pass
-        self._pages[idx] = None
-        # Create new page
-        for attempt in range(5):
-            try:
-                new_page = await _create_page(self.ctx, self.model)
-                if await self._check_health(new_page):
-                    self._pages[idx] = new_page
-                    self._queue.put_nowait(idx)
-                    self._replenishing.discard(idx)
-                    return
-                try:
-                    await new_page.close()
-                except:
-                    pass
-            except Exception as e:
-                print(f"[GLMMode] _replenish({idx}) attempt {attempt+1} failed: {e}", file=sys.stderr)
-            await asyncio.sleep(3)
-        print(f"[GLMMode] _replenish({idx}) UNAVAILABLE after 5 attempts", file=sys.stderr)
-        self._pages[idx] = None
-        self._replenishing.discard(idx)
+                    await asyncio.sleep(1)
 
     async def execute(self, prompt):
         idx = await self._queue.get()
         page = self._pages[idx]
 
-        if page is None or not await self._check_health(page):
+        if not await self._check_health(page):
             print(f"[GLMMode] Page {idx} unhealthy on acquire, recreating", file=sys.stderr)
             await self._recreate_page(idx)
             page = self._pages[idx]
 
         try:
             result, _ = await _send_prompt_once(self.ctx, page, prompt, self.model)
-            # Close page immediately and start creating a fresh one
-            asyncio.create_task(self._replenish(idx))
+            # Reset chat: navigate to URL (fast, cached) instead of creating new page
+            try:
+                await page.goto(URL, wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(0.5)
+            except:
+                # Fallback: recreate page if navigation fails
+                print(f"[GLMMode] Page {idx} reload failed, recreating", file=sys.stderr)
+                await self._recreate_page(idx)
+            self._queue.put_nowait(idx)
             return result
         except Exception as e:
             print(f"[GLMMode] Page {idx} error: {e}, recreating", file=sys.stderr)
-            await self._replenish(idx)  # await — need slot ready for next request
+            await self._recreate_page(idx)
+            self._queue.put_nowait(idx)
             raise
 
     async def chat(self, messages, tools=None):
@@ -496,7 +457,7 @@ def run_server(port=5001):
         }
 
     print(f"\n[GLMMode] API Server on http://0.0.0.0:{port}", file=sys.stderr)
-    print(f"[GLMMode] Pool: {POOL_SIZE} pages", file=sys.stderr)
+    print(f"[GLMMode] Pool: {POOL_SIZE} pages | SSE capture (no close)", file=sys.stderr)
     print(f"[GLMMode] POST /v1/chat/completions\n", file=sys.stderr)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
